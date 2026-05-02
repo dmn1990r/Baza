@@ -537,6 +537,42 @@
     transition: border-color 0.15s;
   }
   .attachment:hover { border-color: var(--gold-dim); }
+  .dropzone {
+    border: 2px dashed var(--gold-dim);
+    border-radius: 8px;
+    padding: 12px;
+    text-align: center;
+    color: var(--text-muted);
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    cursor: pointer;
+    transition: all 0.2s;
+    margin-top: 8px;
+  }
+  .dropzone:hover, .dropzone.dragover {
+    border-color: var(--gold);
+    color: var(--gold);
+    background: rgba(212,175,55,0.05);
+  }
+  .dropzone.uploading {
+    border-color: var(--gold);
+    color: var(--gold);
+    opacity: 0.7;
+    pointer-events: none;
+  }
+  .onedrive-status {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 11px;
+    padding: 3px 8px;
+    border-radius: 4px;
+    cursor: pointer;
+  }
+  .onedrive-status.connected { color: #4caf50; }
+  .onedrive-status.disconnected { color: var(--text-muted); }
+  .onedrive-status.connecting { color: var(--gold); }
   .attachment-icon { color: var(--gold); flex-shrink: 0; font-size: 14px; }
   .attachment-info { flex: 1; min-width: 0; }
   .attachment-name {
@@ -1002,6 +1038,7 @@
       <button id="btnLoad" class="btn btn-ghost">📂 Wczytaj</button>
       <button id="btnExport" class="btn btn-ghost">⬇ Eksport</button>
       <button id="btnAddYear" class="btn" style="display:none">+ Rok</button>
+      <span id="onedriveStatus" class="onedrive-status disconnected" title="Połącz z OneDrive aby przeciągać załączniki">☁ OneDrive</span>
     </div>
   </header>
 
@@ -1907,6 +1944,15 @@ function renderKioDetail(k, yId, cId, pId) {
 
 function renderAttachments(atts, parentType, ids) {
   const addBtn = isEdit() ? `<button class="btn btn-ghost btn-icon" data-act="addAtt" data-parent="${parentType}" data-y="${ids.yId}" data-c="${ids.cId}" data-p="${ids.pId}" ${ids.kId ? `data-k="${ids.kId}"` : ''}>+ załącznik</button>` : '';
+  const dropzoneId = `dz-${parentType}-${ids.yId}-${ids.cId}-${ids.pId}${ids.kId ? '-' + ids.kId : ''}`;
+  const dropzone = isEdit() ? `
+    <div class="dropzone" id="${dropzoneId}"
+      data-parent="${parentType}"
+      data-y="${ids.yId}" data-c="${ids.cId}" data-p="${ids.pId}" ${ids.kId ? `data-k="${ids.kId}"` : ''}
+      onclick="dropzoneClick(this)"
+      ondragover="dzOver(event,this)" ondragleave="dzLeave(this)" ondrop="dzDrop(event,this)">
+      ☁ Przeciągnij plik lub kliknij aby wgrać na OneDrive
+    </div>` : '';
   return `
     <div class="attachments">
       <div class="attachments-title">
@@ -1932,6 +1978,7 @@ function renderAttachments(atts, parentType, ids) {
               </div>`;
           }).join('')}
       </div>
+      ${dropzone}
     </div>`;
 }
 
@@ -2403,6 +2450,248 @@ document.addEventListener('keydown', (e) => {
   if ((e.metaKey || e.ctrlKey) && e.key === 's' && isEdit()) { e.preventDefault(); saveFile(); }
 });
 
+
+// ============================================================
+// ONEDRIVE / GRAPH API — OAuth 2.0 PKCE (bez zewnętrznych lib)
+// ============================================================
+const OD_CLIENT_ID   = '8a387c74-5350-4840-9572-765cbdb84eb0';
+const OD_TENANT_ID   = '6d31a16d-c8d6-4831-aec7-0880ee38c1d8';
+const OD_SCOPES      = 'Files.ReadWrite User.Read offline_access';
+const OD_REDIRECT    = window.location.href.split('?')[0].split('#')[0];
+const ONEDRIVE_BASE  = 'BSKP Baza Danych';
+
+let odToken = null;
+let odTokenExpiry = 0;
+
+// --- PKCE helpers ---
+function b64url(buf) {
+  return btoa(String.fromCharCode(...new Uint8Array(buf)))
+    .replace(/\+/g,'-').replace(/\//g,'_').replace(/=/g,'');
+}
+async function pkceChallenge() {
+  const verifier = b64url(crypto.getRandomValues(new Uint8Array(32)));
+  const hash = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(verifier));
+  return { verifier, challenge: b64url(hash) };
+}
+
+// --- Token storage ---
+function saveTokens(data) {
+  const exp = Date.now() + (data.expires_in - 60) * 1000;
+  sessionStorage.setItem('od_token', data.access_token);
+  sessionStorage.setItem('od_expiry', exp);
+  if (data.refresh_token) sessionStorage.setItem('od_refresh', data.refresh_token);
+  odToken = data.access_token;
+  odTokenExpiry = exp;
+}
+function loadTokens() {
+  odToken = sessionStorage.getItem('od_token');
+  odTokenExpiry = parseInt(sessionStorage.getItem('od_expiry') || '0');
+}
+function clearTokens() {
+  sessionStorage.removeItem('od_token');
+  sessionStorage.removeItem('od_expiry');
+  sessionStorage.removeItem('od_refresh');
+  sessionStorage.removeItem('od_pkce_verifier');
+  odToken = null; odTokenExpiry = 0;
+}
+
+// --- Auth flow ---
+async function startLogin() {
+  const { verifier, challenge } = await pkceChallenge();
+  sessionStorage.setItem('od_pkce_verifier', verifier);
+  const state = b64url(crypto.getRandomValues(new Uint8Array(8)));
+  sessionStorage.setItem('od_state', state);
+  const url = `https://login.microsoftonline.com/${OD_TENANT_ID}/oauth2/v2.0/authorize?`
+    + `client_id=${OD_CLIENT_ID}`
+    + `&response_type=code`
+    + `&redirect_uri=${encodeURIComponent(OD_REDIRECT)}`
+    + `&scope=${encodeURIComponent(OD_SCOPES)}`
+    + `&code_challenge=${challenge}`
+    + `&code_challenge_method=S256`
+    + `&state=${state}`
+    + `&prompt=select_account`;
+  window.location.href = url;
+}
+
+async function exchangeCode(code) {
+  const verifier = sessionStorage.getItem('od_pkce_verifier');
+  const body = new URLSearchParams({
+    client_id: OD_CLIENT_ID,
+    grant_type: 'authorization_code',
+    code,
+    redirect_uri: OD_REDIRECT,
+    code_verifier: verifier,
+    scope: OD_SCOPES
+  });
+  const resp = await fetch(
+    `https://login.microsoftonline.com/${OD_TENANT_ID}/oauth2/v2.0/token`,
+    { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body }
+  );
+  const data = await resp.json();
+  if (!data.access_token) throw new Error(data.error_description || 'Token error');
+  saveTokens(data);
+}
+
+async function refreshToken() {
+  const rt = sessionStorage.getItem('od_refresh');
+  if (!rt) return false;
+  const body = new URLSearchParams({
+    client_id: OD_CLIENT_ID,
+    grant_type: 'refresh_token',
+    refresh_token: rt,
+    scope: OD_SCOPES
+  });
+  const resp = await fetch(
+    `https://login.microsoftonline.com/${OD_TENANT_ID}/oauth2/v2.0/token`,
+    { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body }
+  );
+  const data = await resp.json();
+  if (!data.access_token) return false;
+  saveTokens(data);
+  return true;
+}
+
+async function ensureOdToken() {
+  // Ważny token
+  if (odToken && Date.now() < odTokenExpiry) return odToken;
+  // Spróbuj refresh
+  if (await refreshToken()) return odToken;
+  // Brak tokena — trzeba się zalogować
+  setOdStatus('disconnected');
+  throw new Error('Zaloguj się do OneDrive (kliknij ☁ OneDrive w nagłówku)');
+}
+
+function setOdStatus(status) {
+  const el = $('#onedriveStatus');
+  if (!el) return;
+  el.className = 'onedrive-status ' + status;
+  if (status === 'connected') el.textContent = '✓ OneDrive';
+  else if (status === 'connecting') el.textContent = '⟳ Łączenie…';
+  else el.textContent = '☁ OneDrive';
+}
+
+async function initOAuth() {
+  // Obsłuż redirect z kodem OAuth
+  const params = new URLSearchParams(window.location.search);
+  const code = params.get('code');
+  const state = params.get('state');
+  if (code && state && state === sessionStorage.getItem('od_state')) {
+    setOdStatus('connecting');
+    try {
+      await exchangeCode(code);
+      setOdStatus('connected');
+      toast('Połączono z OneDrive ✓', 'success');
+    } catch(e) {
+      toast('Błąd logowania OneDrive: ' + e.message, 'error');
+      setOdStatus('disconnected');
+    }
+    // Wyczyść URL z parametrami OAuth
+    window.history.replaceState({}, '', window.location.pathname);
+    return;
+  }
+  // Wczytaj zapisany token
+  loadTokens();
+  if (odToken && Date.now() < odTokenExpiry) {
+    setOdStatus('connected');
+  } else if (sessionStorage.getItem('od_refresh')) {
+    const ok = await refreshToken();
+    setOdStatus(ok ? 'connected' : 'disconnected');
+  } else {
+    setOdStatus('disconnected');
+  }
+}
+
+// --- OneDrive upload ---
+function buildOdPath(ids) {
+  const year  = STATE.data.years.find(y => y.id === ids.yId);
+  const client = year?.clients.find(c => c.id === ids.cId);
+  const proc  = client?.procedures.find(p => p.id === ids.pId);
+  const kio   = ids.kId ? proc?.kio?.find(k => k.id === ids.kId) : null;
+  const safe  = s => (s || '').replace(/[/\\:*?"<>|]/g,'-').replace(/\s+/g,'_').slice(0,60);
+  const yearNum = year?.year || new Date().getFullYear();
+  let path = `${ONEDRIVE_BASE}/${yearNum}/${safe(client?.name)}/${safe(proc?.signature || proc?.name)}`;
+  if (kio) path += `/KIO_${safe(kio.signature)}`;
+  return path;
+}
+
+async function uploadToOneDrive(file, ids) {
+  const token = await ensureOdToken();
+  const folderPath = buildOdPath(ids);
+  const fileName = file.name;
+  // Upload (Graph tworzy podfoldery automatycznie)
+  const uploadUrl = `https://graph.microsoft.com/v1.0/me/drive/root:/${folderPath}/${fileName}:/content`;
+  const resp = await fetch(uploadUrl, {
+    method: 'PUT',
+    headers: { 'Authorization': 'Bearer ' + token, 'Content-Type': file.type || 'application/octet-stream' },
+    body: file
+  });
+  if (!resp.ok) {
+    const err = await resp.json().catch(() => ({}));
+    throw new Error(err?.error?.message || `HTTP ${resp.status}`);
+  }
+  const data = await resp.json();
+  // Pobierz sharing link
+  const shareResp = await fetch(`https://graph.microsoft.com/v1.0/me/drive/items/${data.id}/createLink`, {
+    method: 'POST',
+    headers: { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ type: 'view', scope: 'organization' })
+  });
+  let shareUrl = data.webUrl;
+  if (shareResp.ok) { const sd = await shareResp.json(); shareUrl = sd.link?.webUrl || shareUrl; }
+  return { name: fileName, url: shareUrl };
+}
+
+async function handleFileUpload(file, ids) {
+  const dzId = `dz-${ids.parent}-${ids.yId}-${ids.cId}-${ids.pId}${ids.kId ? '-'+ids.kId : ''}`;
+  const dz = document.getElementById(dzId);
+  if (dz) { dz.classList.add('uploading'); dz.textContent = `⬆ Wgrywanie: ${file.name}…`; }
+  try {
+    const { name, url } = await uploadToOneDrive(file, ids);
+    const parent = ids.parent === 'kio'
+      ? findKio(ids.yId, ids.cId, ids.pId, ids.kId)
+      : findProc(ids.yId, ids.cId, ids.pId);
+    parent.attachments.push({ id: 'a' + uid(), name, url, category: '', date: '', desc: '' });
+    toast(`✓ Wgrano: ${name}`, 'success');
+    renderActive();
+    saveFile();
+  } catch(e) {
+    toast('Błąd: ' + e.message, 'error');
+    if (dz) { dz.classList.remove('uploading'); dz.textContent = '☁ Przeciągnij plik lub kliknij aby wgrać na OneDrive'; }
+  }
+}
+
+function dzOver(e, el) { e.preventDefault(); el.classList.add('dragover'); }
+function dzLeave(el) { el.classList.remove('dragover'); }
+function dzDrop(e, el) {
+  e.preventDefault(); el.classList.remove('dragover');
+  const file = e.dataTransfer.files[0];
+  if (!file) return;
+  const ids = { parent: el.dataset.parent, yId: el.dataset.y, cId: el.dataset.c, pId: el.dataset.p, kId: el.dataset.k || null };
+  handleFileUpload(file, ids);
+}
+function dropzoneClick(el) {
+  const input = document.createElement('input');
+  input.type = 'file';
+  input.onchange = e => {
+    const file = e.target.files[0];
+    if (!file) return;
+    const ids = { parent: el.dataset.parent, yId: el.dataset.y, cId: el.dataset.c, pId: el.dataset.p, kId: el.dataset.k || null };
+    handleFileUpload(file, ids);
+  };
+  input.click();
+}
+
+$('#onedriveStatus').addEventListener('click', async () => {
+  if (odToken && Date.now() < odTokenExpiry) {
+    clearTokens();
+    setOdStatus('disconnected');
+    toast('Rozłączono z OneDrive', 'success');
+  } else {
+    await startLogin();
+  }
+});
+
+initOAuth();
 initApp();
 </script>
 </body>
